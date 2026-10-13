@@ -1,44 +1,61 @@
 /*
-  MG996R Servo Payload Release - Teensy 4.1
-  ------------------------------------------
-  Drives an MG996/MG996R servo-powered payload release (drop) mechanism.
+  MG996R Servo Payload Release - Teensy 4.1 (Ethernet web control)
+  -----------------------------------------------------------------
+  Drives an MG996/MG996R servo-powered payload release (drop) mechanism and
+  serves a control page over the Teensy 4.1's built-in Ethernet.
 
-  Ways to trigger a drop:
-    1. USB Serial commands (115200 baud, newline terminated) - type "help"
-    2. A push button on BUTTON_PIN (short press = drop, hold 2 s = arm/disarm)
-    3. An RC receiver channel on RC_PIN (e.g. a switch on your transmitter)
+  Ways to control it:
+    1. Web GUI   - browse to http://payload.local (or the IP printed on Serial)
+    2. USB Serial commands (115200 baud, newline terminated) - type "help"
+    3. Optional push button on BUTTON_PIN (short press = drop, hold 2 s = arm/disarm)
 
   Safety:
-    - The unit boots DISARMED. Serial and button drops need the unit armed.
-    - The RC trigger uses the transmitter switch as the safety: it only fires
-      after the switch has been seen in the LOW position since boot, so a
-      switch left high at power-up will not drop the payload.
-    - If the RC signal is lost, nothing happens (it never drops on failsafe).
+    - The unit boots DISARMED. Every drop (web, serial, button) needs it armed.
+    - Web actions use POST, so a browser prefetch/link preview can't fire a drop.
+    - Set WEB_KEY to require a key for web actions. Keep it on your LAN - do
+      NOT port-forward this to the internet (use a VPN if you need remote access).
+
+  Hardware:
+    Teensy 4.1 + Ethernet kit (the MagJack/RJ45 adapter soldered to the 6-pin
+    Ethernet header) plugged into your router/switch.
 
   Wiring (see README.md):
     Servo signal (orange) -> Teensy pin 9
     Servo +V (red)        -> external 5-6 V supply, 3 A or more (NOT Teensy 5V/3.3V)
     Servo GND (brown)     -> supply GND AND Teensy GND (common ground required)
-    Button                -> pin 2 to GND (internal pull-up used)
-    RC receiver signal    -> pin 3 (receiver GND to Teensy GND)
+    Button (optional)     -> pin 2 to GND (internal pull-up used)
 
-  Calibration values are stored in EEPROM, so set them once with "set" + "save".
+  Calibration values are stored in EEPROM, so set them once and press "Save".
 */
 
 #include <Servo.h>
 #include <EEPROM.h>
+#include <QNEthernet.h>
+#include "WebPage.h"
+
+using namespace qindesign::network;
 
 // ---------------- User configuration ----------------
 const uint8_t SERVO_PIN  = 9;
 const uint8_t BUTTON_PIN = 2;
-const uint8_t RC_PIN     = 3;
 const uint8_t LED_PIN    = LED_BUILTIN;   // pin 13 on Teensy 4.1
 
-#define USE_BUTTON    1   // set to 0 if no button is fitted
-#define USE_RC_INPUT  1   // set to 0 if no RC receiver is connected
+#define USE_BUTTON 1   // set to 0 if no button is fitted
+
+// Network. DHCP is used by default; set USE_DHCP to 0 for a fixed address.
+#define USE_DHCP 1
+const IPAddress STATIC_IP(192, 168, 1, 50);
+const IPAddress STATIC_MASK(255, 255, 255, 0);
+const IPAddress STATIC_GATEWAY(192, 168, 1, 1);
+const char *HOSTNAME = "payload";          // -> http://payload.local
+const uint16_t HTTP_PORT = 80;
+
+// Optional access key for web actions. "" = no key needed.
+// If set, enter the same key in the web page's Settings box.
+const char *WEB_KEY = "";
 
 // Default positions in microseconds. MG996R covers ~180 deg over 500-2500 us.
-// Use the "jog" command to find the right values for your mechanism.
+// Use the jog slider (web) or "jog" command to find values for your mechanism.
 const uint16_t DEFAULT_CLOSED_US     = 1000;  // hook/latch closed (holding payload)
 const uint16_t DEFAULT_OPEN_US       = 2000;  // hook/latch open (payload released)
 const uint32_t DEFAULT_AUTOCLOSE_MS  = 3000;  // 0 = stay open after a drop
@@ -47,12 +64,9 @@ const uint16_t SERVO_MIN_US = 500;            // hard limits for any command
 const uint16_t SERVO_MAX_US = 2500;
 const float    CLOSE_SPEED_US_PER_MS = 1.0f;  // slow close so it doesn't snap/jam
 
-const uint16_t RC_TRIGGER_HIGH_US = 1700;     // above this = "drop"
-const uint16_t RC_TRIGGER_LOW_US  = 1300;     // below this = "safe / re-arm switch"
-const uint32_t RC_TIMEOUT_MS      = 100;      // no pulses for this long = signal lost
-
 const uint32_t BUTTON_DEBOUNCE_MS = 30;
 const uint32_t BUTTON_HOLD_MS     = 2000;
+const uint32_t HTTP_TIMEOUT_MS    = 1000;     // max time to wait for a request
 
 // ---------------- Persistent settings ----------------
 struct Settings {
@@ -77,12 +91,9 @@ uint32_t openedAtMs = 0;
 bool autoClosePending = false;   // only drops auto-close; manual "open" stays open
 uint32_t dropCount = 0;
 
-// RC input (written in ISR)
-volatile uint32_t rcRiseUs = 0;
-volatile uint16_t rcPulseUs = 0;
-volatile uint32_t rcLastPulseMs = 0;
-bool rcSeenLow = false;      // switch must be seen low before it can trigger
-bool rcWasHigh = false;
+// Network
+EthernetServer server{HTTP_PORT};
+bool networkReported = false;
 
 // Button
 bool buttonStable = HIGH;
@@ -117,6 +128,12 @@ void loadSettings() {
 void saveSettings() {
   EEPROM.put(SETTINGS_ADDR, cfg);
   Serial.println(F("Settings saved to EEPROM."));
+}
+
+void restoreDefaults() {
+  cfg.closedUs = DEFAULT_CLOSED_US;
+  cfg.openUs = DEFAULT_OPEN_US;
+  cfg.autoCloseMs = DEFAULT_AUTOCLOSE_MS;
 }
 
 // Jump straight to a position (used for opening - we want it fast).
@@ -168,16 +185,16 @@ void closeRelease() {
   Serial.println(F("Release closing."));
 }
 
-// A "drop" is an open followed by auto-close (if enabled). Needs to be armed
-// unless it comes from the RC switch (see header comment).
-void drop(const char *source, bool needArm) {
-  if (needArm && !armed) {
-    Serial.println(F("Refused: DISARMED. Send \"arm\" first."));
-    return;
+// A "drop" is an open followed by auto-close (if enabled). Always needs arming.
+bool drop(const char *source) {
+  if (!armed) {
+    Serial.println(F("Drop refused: DISARMED."));
+    return false;
   }
   dropCount++;
   openRelease(source);
   autoClosePending = cfg.autoCloseMs > 0;
+  return true;
 }
 
 void setArmed(bool a) {
@@ -196,16 +213,10 @@ void printStatus() {
   if (cfg.autoCloseMs) { Serial.print(cfg.autoCloseMs); Serial.println(F(" ms")); }
   else Serial.println(F("off"));
   Serial.print(F("Drops:        ")); Serial.println(dropCount);
-#if USE_RC_INPUT
-  noInterrupts();
-  uint16_t p = rcPulseUs;
-  uint32_t last = rcLastPulseMs;
-  interrupts();
-  Serial.print(F("RC input:     "));
-  if (p != 0 && millis() - last < RC_TIMEOUT_MS) { Serial.print(p); Serial.print(F(" us")); }
-  else Serial.print(F("no signal"));
-  Serial.println(rcSeenLow ? F("") : F(" (waiting for switch LOW)"));
-#endif
+  Serial.print(F("Ethernet:     "));
+  if (!Ethernet.linkState()) Serial.println(F("no cable/link"));
+  else if (uint32_t(Ethernet.localIP()) == 0) Serial.println(F("link up, waiting for IP"));
+  else { Serial.print(F("http://")); Serial.println(Ethernet.localIP()); }
 }
 
 void printHelp() {
@@ -213,13 +224,27 @@ void printHelp() {
   Serial.println(F("  arm | disarm          enable/disable drops"));
   Serial.println(F("  drop                  release payload (must be armed)"));
   Serial.println(F("  open | close          move release manually (no auto-close)"));
-  Serial.println(F("  status                show current state"));
+  Serial.println(F("  status                show current state and IP address"));
   Serial.println(F("  jog <us>              move servo to raw position (calibration)"));
   Serial.println(F("  set closed <us>       set closed position (500-2500)"));
   Serial.println(F("  set open <us>         set open position (500-2500)"));
   Serial.println(F("  set autoclose <ms>    auto-close delay after drop, 0 = off"));
   Serial.println(F("  save                  store settings in EEPROM"));
   Serial.println(F("  defaults              restore default settings (not saved)"));
+}
+
+void setClosed(long v) {
+  cfg.closedUs = clampUs(v);
+  if (!isOpen) moveSlow(cfg.closedUs);
+}
+
+void setOpen(long v) {
+  cfg.openUs = clampUs(v);
+  if (isOpen) moveNow(cfg.openUs);
+}
+
+void setAutoClose(long v) {
+  cfg.autoCloseMs = v < 0 ? 0 : (uint32_t)v;
 }
 
 // ---------------- Serial command handling ----------------
@@ -240,7 +265,7 @@ void handleCommand(char *line) {
   } else if (!strcmp(cmd, "disarm")) {
     setArmed(false);
   } else if (!strcmp(cmd, "drop")) {
-    drop("serial", true);
+    drop("serial");
   } else if (!strcmp(cmd, "open")) {
     openRelease("manual");
   } else if (!strcmp(cmd, "close")) {
@@ -254,15 +279,13 @@ void handleCommand(char *line) {
   } else if (!strcmp(cmd, "set") && arg1 && arg2) {
     long v = atol(arg2);
     if (!strcmp(arg1, "closed")) {
-      cfg.closedUs = clampUs(v);
-      if (!isOpen) moveSlow(cfg.closedUs);
+      setClosed(v);
       Serial.print(F("Closed = ")); Serial.println(cfg.closedUs);
     } else if (!strcmp(arg1, "open")) {
-      cfg.openUs = clampUs(v);
-      if (isOpen) moveNow(cfg.openUs);
+      setOpen(v);
       Serial.print(F("Open = ")); Serial.println(cfg.openUs);
     } else if (!strcmp(arg1, "autoclose")) {
-      cfg.autoCloseMs = v < 0 ? 0 : (uint32_t)v;
+      setAutoClose(v);
       Serial.print(F("Auto-close = ")); Serial.println(cfg.autoCloseMs);
     } else {
       Serial.println(F("Unknown setting. Try: closed, open, autoclose"));
@@ -270,9 +293,7 @@ void handleCommand(char *line) {
   } else if (!strcmp(cmd, "save")) {
     saveSettings();
   } else if (!strcmp(cmd, "defaults")) {
-    cfg.closedUs = DEFAULT_CLOSED_US;
-    cfg.openUs = DEFAULT_OPEN_US;
-    cfg.autoCloseMs = DEFAULT_AUTOCLOSE_MS;
+    restoreDefaults();
     Serial.println(F("Defaults restored (use \"save\" to keep them)."));
   } else {
     Serial.println(F("Unknown command. Type \"help\"."));
@@ -311,7 +332,7 @@ void pollButton() {
       buttonPressedMs = now;
       buttonHoldHandled = false;
     } else if (!buttonHoldHandled) {      // released after a short press
-      drop("button", true);
+      drop("button");
     }
   }
   // long hold toggles arm state
@@ -322,40 +343,188 @@ void pollButton() {
 }
 #endif
 
-// ---------------- RC receiver input ----------------
-#if USE_RC_INPUT
-void rcIsr() {
-  uint32_t now = micros();
-  if (digitalReadFast(RC_PIN)) {
-    rcRiseUs = now;
-  } else {
-    uint32_t w = now - rcRiseUs;
-    if (w >= 800 && w <= 2200) {          // ignore glitches
-      rcPulseUs = w;
-      rcLastPulseMs = millis();
+// ---------------- Web server ----------------
+void startNetwork() {
+#if USE_DHCP
+  if (!Ethernet.begin()) Serial.println(F("Ethernet failed to start."));
+#else
+  if (!Ethernet.begin(STATIC_IP, STATIC_MASK, STATIC_GATEWAY)) {
+    Serial.println(F("Ethernet failed to start."));
+  }
+#endif
+  server.begin();
+}
+
+// Prints the address once it is known and starts mDNS (http://payload.local).
+void pollNetwork() {
+  bool haveIp = Ethernet.linkState() && uint32_t(Ethernet.localIP()) != 0;
+  if (haveIp && !networkReported) {
+    networkReported = true;
+    if (MDNS.begin(HOSTNAME)) MDNS.addService("_http", "_tcp", HTTP_PORT);
+    Serial.print(F("Web GUI: http://"));
+    Serial.print(Ethernet.localIP());
+    Serial.print(F("  or  http://"));
+    Serial.print(HOSTNAME);
+    Serial.println(F(".local"));
+  } else if (!haveIp && networkReported) {
+    networkReported = false;
+    MDNS.end();
+    Serial.println(F("Ethernet link lost."));
+  }
+}
+
+// Reads one line (without CR/LF). Returns false on timeout/disconnect.
+bool readHttpLine(EthernetClient &c, char *buf, size_t size, uint32_t deadline) {
+  size_t n = 0;
+  while ((int32_t)(millis() - deadline) < 0) {
+    if (c.available()) {
+      char ch = c.read();
+      if (ch == '\r') continue;
+      if (ch == '\n') { buf[n] = 0; return true; }
+      if (n < size - 1) buf[n++] = ch;
+    } else if (!c.connected()) {
+      break;
+    } else {
+      yield();
     }
   }
+  buf[n] = 0;
+  return false;
 }
 
-void pollRc() {
-  noInterrupts();
-  uint16_t p = rcPulseUs;
-  uint32_t last = rcLastPulseMs;
-  interrupts();
-
-  if (p == 0 || millis() - last >= RC_TIMEOUT_MS) return;   // no/lost signal: do nothing
-
-  if (p <= RC_TRIGGER_LOW_US) {
-    if (!rcSeenLow) Serial.println(F("RC switch seen LOW - RC trigger ready."));
-    rcSeenLow = true;
-    if (rcWasHigh && isOpen) closeRelease();       // flicking switch back closes it
-    rcWasHigh = false;
-  } else if (p >= RC_TRIGGER_HIGH_US && rcSeenLow && !rcWasHigh) {
-    rcWasHigh = true;                              // edge-triggered: one drop per flick
-    drop("rc", false);
+// Finds name=value in a query string ("a=1&b=2"). Returns true if found.
+bool queryParam(const char *query, const char *name, long &out) {
+  size_t len = strlen(name);
+  const char *p = query;
+  while (p && *p) {
+    if (!strncmp(p, name, len) && p[len] == '=') {
+      out = atol(p + len + 1);
+      return true;
+    }
+    p = strchr(p, '&');
+    if (p) p++;
   }
+  return false;
 }
-#endif
+
+void sendResponse(EthernetClient &c, int code, const char *type, const char *body) {
+  const char *reason = code == 200 ? "OK" : code == 401 ? "Unauthorized"
+                     : code == 404 ? "Not Found" : code == 405 ? "Method Not Allowed"
+                     : code == 409 ? "Conflict" : "Bad Request";
+  char header[192];
+  size_t bodyLen = strlen(body);
+  int n = snprintf(header, sizeof(header),
+                   "HTTP/1.1 %d %s\r\n"
+                   "Content-Type: %s\r\n"
+                   "Content-Length: %u\r\n"
+                   "Cache-Control: no-store\r\n"
+                   "Connection: close\r\n\r\n",
+                   code, reason, type, (unsigned)bodyLen);
+  c.writeFully(header, n);
+  c.writeFully(body, bodyLen);
+  c.flush();
+}
+
+void sendStatus(EthernetClient &c, int code, const char *error) {
+  char json[320];
+  snprintf(json, sizeof(json),
+           "{\"armed\":%s,\"open\":%s,\"pos\":%d,\"closedUs\":%u,\"openUs\":%u,"
+           "\"autoCloseMs\":%lu,\"drops\":%lu,\"uptimeS\":%lu,\"keyRequired\":%s%s%s%s}",
+           armed ? "true" : "false", isOpen ? "true" : "false",
+           (int)(currentUs + 0.5f), cfg.closedUs, cfg.openUs,
+           (unsigned long)cfg.autoCloseMs, (unsigned long)dropCount,
+           (unsigned long)(millis() / 1000), WEB_KEY[0] ? "true" : "false",
+           error ? ",\"error\":\"" : "", error ? error : "", error ? "\"" : "");
+  sendResponse(c, code, "application/json", json);
+}
+
+void handleHttp(EthernetClient &c) {
+  uint32_t deadline = millis() + HTTP_TIMEOUT_MS;
+  char line[160];
+  if (!readHttpLine(c, line, sizeof(line), deadline)) return;
+
+  // Request line: METHOD /path?query HTTP/1.1
+  char *method = strtok(line, " ");
+  char *target = strtok(NULL, " ");
+  if (!method || !target) { sendResponse(c, 400, "text/plain", "Bad request"); return; }
+  char path[64];
+  char query[96] = "";
+  char *q = strchr(target, '?');
+  if (q) {
+    *q = 0;
+    strncpy(query, q + 1, sizeof(query) - 1);
+    query[sizeof(query) - 1] = 0;
+  }
+  strncpy(path, target, sizeof(path) - 1);
+  path[sizeof(path) - 1] = 0;
+  bool isGet = !strcmp(method, "GET");
+  bool isPost = !strcmp(method, "POST");
+
+  // Headers - we only care about X-Key.
+  char hdr[160];
+  char key[48] = "";
+  while (readHttpLine(c, hdr, sizeof(hdr), deadline) && hdr[0]) {
+    if (!strncasecmp(hdr, "x-key:", 6)) {
+      const char *v = hdr + 6;
+      while (*v == ' ') v++;
+      strncpy(key, v, sizeof(key) - 1);
+      key[sizeof(key) - 1] = 0;
+    }
+  }
+
+  if (!strcmp(path, "/")) {
+    if (!isGet) { sendResponse(c, 405, "text/plain", "Use GET"); return; }
+    sendResponse(c, 200, "text/html; charset=utf-8", INDEX_HTML);
+    return;
+  }
+  if (!strcmp(path, "/api/status")) {
+    sendStatus(c, 200, nullptr);
+    return;
+  }
+  if (strncmp(path, "/api/", 5)) { sendResponse(c, 404, "text/plain", "Not found"); return; }
+
+  // Everything else under /api/ changes state: POST only, key checked.
+  if (!isPost) { sendStatus(c, 405, "use POST"); return; }
+  if (WEB_KEY[0] && strcmp(key, WEB_KEY)) { sendStatus(c, 401, "wrong or missing key"); return; }
+
+  const char *action = path + 5;
+  long v;
+  if (!strcmp(action, "arm")) {
+    setArmed(true);
+  } else if (!strcmp(action, "disarm")) {
+    setArmed(false);
+  } else if (!strcmp(action, "drop")) {
+    if (!drop("web")) { sendStatus(c, 409, "disarmed - arm first"); return; }
+  } else if (!strcmp(action, "open")) {
+    openRelease("web manual");
+  } else if (!strcmp(action, "close")) {
+    closeRelease();
+  } else if (!strcmp(action, "jog")) {
+    if (!queryParam(query, "us", v)) { sendStatus(c, 400, "missing us"); return; }
+    moveNow(clampUs(v));
+  } else if (!strcmp(action, "set")) {
+    if (queryParam(query, "closed", v)) setClosed(v);
+    if (queryParam(query, "open", v)) setOpen(v);
+    if (queryParam(query, "autoclose", v)) setAutoClose(v);
+  } else if (!strcmp(action, "save")) {
+    saveSettings();
+  } else if (!strcmp(action, "defaults")) {
+    restoreDefaults();
+  } else {
+    sendStatus(c, 404, "unknown action");
+    return;
+  }
+  sendStatus(c, 200, nullptr);
+}
+
+void pollWeb() {
+  // available() only hands over connections that have sent data, so idle
+  // browser pre-connections never stall the loop.
+  EthernetClient client = server.available();
+  if (!client) return;
+  handleHttp(client);
+  client.stop();
+}
 
 // ---------------- LED ----------------
 void updateLed() {
@@ -371,10 +540,6 @@ void setup() {
 #if USE_BUTTON
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 #endif
-#if USE_RC_INPUT
-  pinMode(RC_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(RC_PIN), rcIsr, CHANGE);
-#endif
 
   loadSettings();
 
@@ -384,17 +549,18 @@ void setup() {
 
   Serial.begin(115200);
   uint32_t t = millis();
-  while (!Serial && millis() - t < 1500) {}  // wait briefly for USB, don't block flight
+  while (!Serial && millis() - t < 1500) {}  // wait briefly for USB, don't block
   Serial.println(F("MG996R Payload Release ready (DISARMED). Type \"help\"."));
+
+  startNetwork();
 }
 
 void loop() {
   pollSerial();
+  pollNetwork();
+  pollWeb();
 #if USE_BUTTON
   pollButton();
-#endif
-#if USE_RC_INPUT
-  pollRc();
 #endif
 
   // Auto-close after a drop.

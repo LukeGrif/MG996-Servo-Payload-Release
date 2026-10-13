@@ -57,7 +57,7 @@ const char *WEB_KEY = "";
 
 // Default positions in microseconds. MG996R covers ~180 deg over 500-2500 us.
 // Use the jog slider (web) or "jog" command to find values for your mechanism.
-const uint16_t DEFAULT_CLOSED_US     = 1000;  // hook/latch closed (holding payload)
+const uint16_t DEFAULT_CLOSED_US     = 1350;  // hook/latch closed (holding payload)
 const uint16_t DEFAULT_OPEN_US       = 2000;  // hook/latch open (payload released)
 const uint32_t DEFAULT_AUTOCLOSE_MS  = 3000;  // 0 = stay open after a drop
 

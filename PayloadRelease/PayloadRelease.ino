@@ -5,7 +5,7 @@
   serves a control page over the Teensy 4.1's built-in Ethernet.
 
   Ways to control it:
-    1. Web GUI   - browse to http://payload.local (or the IP printed on Serial)
+    1. Web GUI   - browse to http://192.168.2.50 (or http://payload.local)
     2. USB Serial commands (115200 baud, newline terminated) - type "help"
     3. Optional push button on BUTTON_PIN (short press = drop, hold 2 s = arm/disarm)
 
@@ -42,11 +42,12 @@ const uint8_t LED_PIN    = LED_BUILTIN;   // pin 13 on Teensy 4.1
 
 #define USE_BUTTON 1   // set to 0 if no button is fitted
 
-// Network. DHCP is used by default; set USE_DHCP to 0 for a fixed address.
-#define USE_DHCP 1
-const IPAddress STATIC_IP(192, 168, 1, 50);
+// Network. A fixed address is used by default; set USE_DHCP to 1 to get an
+// address from your router instead (the STATIC_* values are then ignored).
+#define USE_DHCP 0
+const IPAddress STATIC_IP(192, 168, 2, 50);       // -> http://192.168.2.50
 const IPAddress STATIC_MASK(255, 255, 255, 0);
-const IPAddress STATIC_GATEWAY(192, 168, 1, 1);
+const IPAddress STATIC_GATEWAY(192, 168, 2, 1);
 const char *HOSTNAME = "payload";          // -> http://payload.local
 const uint16_t HTTP_PORT = 80;
 
